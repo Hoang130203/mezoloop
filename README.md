@@ -27,7 +27,7 @@ The vault is a first-class MUSD protocol participant:
 | `BorrowerOperations` | `openTrove`, `addColl`, `withdrawColl`, `withdrawMUSD`, `repayMUSD`, `closeTrove`, `claimCollateral`, `minNetDebt`, `borrowingRate` |
 | `TroveManager` | `getTroveColl/Debt/Status`, `getCurrentICR`, `getNominalICR` |
 | `PriceFeed` | `fetchPrice()` — BTC/USD driving all leverage math |
-| `HintHelpers` | `getApproxHint` — sorted-list insertion hints computed **on-chain** |
+| `HintHelpers` + `SortedTroves` | insertion hints — `getApproxHint` on-chain for batch calls, or exact `(prevId, nextId)` resolved off-chain by the keeper path |
 | Mezo Pools router | Aerodrome-style `swapExactTokensForTokens(Route[])` on the live `MUSD/BTC` pool |
 | BTC precompile `0x7b7C…` | ERC20 facade over native BTC — the pool's `token1` |
 
@@ -53,9 +53,15 @@ growing the two metrics Mezo cares about.
   (ICR < floor), collateral withdrawal is protocol-blocked — the honest
   answer is external MUSD repayment or `setUnwindFloorICR` closer to MCR.
   This is documented, not hidden.
-- **Hints on-chain.** `getApproxHint(nicr, trials, seed)` is called inside
-  the vault; the result is passed as both prev/next id per the canonical
-  Liquity insertion pattern. No off-chain hint service.
+- **Hints: on-chain or off-chain.** `enter`/`loopToTarget` resolve hints
+  on-chain via `getApproxHint` (canonical Liquity pattern). But on Mezo
+  testnet (~10M block gas) an inexact hint triggers an O(n) SortedTroves
+  list walk inside the protocol — several million gas. For reliability the
+  vault also exposes a **keeper step API** (`planLeverageStep`,
+  `openTroveStep`, `borrowStep`, `swapTopUpStep`, `refiStep`) that takes
+  exact `(prevId, nextId)` pairs resolved off-chain for free. `live.ts`
+  drives it: one step per tx, converging in a handful of transactions —
+  the same way production keeper bots operate leverage vaults.
 - **Native BTC everywhere.** On Mezo, BTC is a precompile at
   `0x7b7C000000000000000000000000000000000000` — an ERC20 facade whose
   `balanceOf` mirrors the native balance. Mezo Pools swaps therefore settle
@@ -108,8 +114,16 @@ cp .env.example .env     # fill MEZO_PRIVATE_KEY (never commit)
 npm run deploy:testnet   # writes deployments.json
 ```
 
-Then either drive `enter(0, 8)` from a script/console, or serve `app/`
-(`npx serve app`) and click through the UI.
+Then run the live keeper loop:
+
+```bash
+npx hardhat run scripts/live.ts --network mezoTestnet
+```
+
+It deposits, opens the trove, and steps the loop (`refiStep` → `borrowStep`
+→ `swapTopUpStep`) one tx at a time until ICR converges — resolving all
+SortedTroves hints off-chain. `enter(0, n)`/`loopToTarget(n)` still work
+for small n, but chunking is required on testnet (10M block gas).
 
 **Live-demo requirements:** enough testnet BTC for collateral such that the
 first borrow clears `minNetDebt` (~1800 MUSD ⇒ ≳0.03 BTC at ~$84k oracle),
@@ -131,7 +145,9 @@ See `scripts/constants.ts` — all pulled from mezo.org/docs: MUSD
 ## Wave 1 scope & honest limits
 
 - Single pooled trove owned by the vault (shares = pro-rata equity).
-- Leverage management is `onlyOwner` (keeper automation is Wave 2).
+- Leverage management is `onlyOwner` (keeper automation is Wave 2) —
+  including the step API, which exists precisely so a keeper can drive it
+  chunk-by-chunk under the testnet block gas limit.
 - `enter` needs deposits ≥ ~minNetDebt worth of BTC.
 - Exits revert with `InsufficientExitLiquidity` when the 12-step unwind
   can't release 99.5% of pro-rata collateral (huge exits at low ICR) —

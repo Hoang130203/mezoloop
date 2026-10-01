@@ -30,9 +30,14 @@ contract MockMusdCore is IBorrowerOperations, ITroveManager, IHintHelpers {
     struct TroveData {
         uint256 coll;
         uint256 debt;
+        uint256 maxBorrowingCapacity;
         Status status;
     }
     mapping(address => TroveData) public troves;
+
+    /// @dev MUSD charges a refinancing fee of this % of net debt, run through
+    /// the borrowing fee — i.e. effective debt add ≈ debt * pct * rate.
+    uint8 public refinancingFeePercentage = 20;
 
     constructor(address _musd, address _priceFeed) {
         musdToken = MockMusd(_musd);
@@ -52,6 +57,11 @@ contract MockMusdCore is IBorrowerOperations, ITroveManager, IHintHelpers {
         uint256 fee = (_debtAmount * borrowingRate) / P;
         t.coll = msg.value;
         t.debt = _debtAmount + fee;
+        // Debt ceiling snapshots opening collateral: coll*price/MCR — exactly
+        // the real protocol's _calculateMaxBorrowingCapacity at openTrove.
+        t.maxBorrowingCapacity =
+            (msg.value * priceFeedContract.fetchPrice()) /
+            MCR;
         t.status = Status.active;
         require(_icr(t.coll, t.debt) >= MCR, "ICR < MCR");
         musdToken.mint(msg.sender, _debtAmount);
@@ -73,6 +83,7 @@ contract MockMusdCore is IBorrowerOperations, ITroveManager, IHintHelpers {
             "ICR < MCR"
         );
         t.coll = newColl;
+        _shrinkCap(t, newColl);
         (bool ok, ) = msg.sender.call{value: _amount}("");
         require(ok, "send failed");
     }
@@ -82,6 +93,7 @@ contract MockMusdCore is IBorrowerOperations, ITroveManager, IHintHelpers {
         require(t.status == Status.active, "no trove");
         uint256 fee = (_amount * borrowingRate) / P;
         uint256 newDebt = t.debt + _amount + fee;
+        require(newDebt <= t.maxBorrowingCapacity, "maxBorrowingCapacity");
         require(_icr(t.coll, newDebt) >= MCR, "ICR < MCR");
         t.debt = newDebt;
         musdToken.mint(msg.sender, _amount);
@@ -113,6 +125,10 @@ contract MockMusdCore is IBorrowerOperations, ITroveManager, IHintHelpers {
         if (_debtChange > 0) {
             if (_isDebtIncrease) {
                 newDebt += _debtChange + (_debtChange * borrowingRate) / P;
+                require(
+                    newDebt <= t.maxBorrowingCapacity,
+                    "maxBorrowingCapacity"
+                );
             } else {
                 uint256 pay = _debtChange > newDebt ? newDebt : _debtChange;
                 musdToken.burnFrom(msg.sender, pay);
@@ -125,6 +141,7 @@ contract MockMusdCore is IBorrowerOperations, ITroveManager, IHintHelpers {
         );
         t.coll = newColl;
         t.debt = newDebt;
+        if (_collWithdrawal > 0) _shrinkCap(t, newColl);
         if (_isDebtIncrease && _debtChange > 0)
             musdToken.mint(msg.sender, _debtChange);
         if (_collWithdrawal > 0) {
@@ -139,12 +156,25 @@ contract MockMusdCore is IBorrowerOperations, ITroveManager, IHintHelpers {
         require(t.debt == 0, "debt outstanding");
         uint256 refund = t.coll;
         t.coll = 0;
+        t.maxBorrowingCapacity = 0;
         t.status = Status.closedByOwner;
         (bool ok, ) = msg.sender.call{value: refund}("");
         require(ok, "send failed");
     }
 
-    function refinance(address, address) external override {}
+    /// @dev Mirrors MUSD: accrues refinancingFeePercentage% of net debt run
+    /// through the borrowing fee, and RECOMPUTES the debt ceiling from the
+    /// trove's current collateral — the only path that raises it.
+    function refinance(address, address) external override {
+        TroveData storage t = troves[msg.sender];
+        require(t.status == Status.active, "no trove");
+        uint256 fee = (((t.debt * refinancingFeePercentage) / 100) *
+            borrowingRate) / P;
+        t.debt += fee;
+        t.maxBorrowingCapacity =
+            (t.coll * priceFeedContract.fetchPrice()) /
+            MCR;
+    }
 
     function claimCollateral() external override {}
 
@@ -204,6 +234,12 @@ contract MockMusdCore is IBorrowerOperations, ITroveManager, IHintHelpers {
         return false;
     }
 
+    function getTroveMaxBorrowingCapacity(
+        address b
+    ) external view override returns (uint256) {
+        return troves[b].maxBorrowingCapacity;
+    }
+
     // ---------------- HintHelpers ----------------
 
     function getApproxHint(
@@ -236,5 +272,12 @@ contract MockMusdCore is IBorrowerOperations, ITroveManager, IHintHelpers {
     function _icr(uint256 coll, uint256 debt) internal view returns (uint256) {
         if (debt == 0) return type(uint256).max;
         return (coll * priceFeedContract.fetchPrice()) / debt;
+    }
+
+    /// @dev MUSD lowers the ceiling to min(current, newColl*price/MCR) whenever
+    /// collateral leaves the trove — and never raises it outside refinance().
+    function _shrinkCap(TroveData storage t, uint256 newColl) internal {
+        uint256 newCap = (newColl * priceFeedContract.fetchPrice()) / MCR;
+        if (newCap < t.maxBorrowingCapacity) t.maxBorrowingCapacity = newCap;
     }
 }

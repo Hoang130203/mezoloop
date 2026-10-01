@@ -30,8 +30,11 @@ import {ISwapAdapter} from "./interfaces/ISwapAdapter.sol";
  * ICR stays above its MCR, so exits/unwinds are executed as a bounded
  * repay<->withdraw loop inside a single transaction.
  *
- * SortedTroves insertion hints are resolved fully on-chain through
- * HintHelpers.getApproxHint — no off-chain hint service needed.
+ * SortedTroves insertion hints can be resolved either on-chain
+ * (getApproxHint inside the loop, convenient for small batches) or
+ * off-chain via the keeper-style step API — recommended on Mezo testnet
+ * where a ~10M block gas limit can make inexact-hint list walks exceed
+ * the per-transaction budget.
  *
  * Wave 1 scope: single pooled trove, owner-operated leverage management.
  */
@@ -39,6 +42,10 @@ contract MezoLoopVault is ERC20, ReentrancyGuard, Ownable {
     uint256 private constant PRECISION = 1e18;
     uint256 private constant BPS = 10_000;
     uint8 private constant MAX_ITERS = 12;
+    /// @dev Refinance calls refresh the trove's debt ceiling (MUSD snapshots
+    /// it at openTrove and only recomputes on refinance). A few unlocks are
+    /// enough for the loop to converge; each costs ~0.02% of debt.
+    uint8 private constant MAX_REFIS = 6;
 
     uint256 public constant MIN_TARGET_ICR = 1.25e18; // stay clear of MCR (~110%)
     uint256 public constant MAX_TARGET_ICR = 5e18;
@@ -70,6 +77,7 @@ contract MezoLoopVault is ERC20, ReentrancyGuard, Ownable {
     event Levered(uint256 musdBorrowed, uint256 btcAdded, uint256 icrAfter);
     event Delevered(uint256 collWithdrawn, uint256 musdRepaid, uint256 icrAfter);
     event AllClosed(uint256 residualDebt, uint256 btcBalance);
+    event CapacityRefreshed(uint256 previousCap);
     event SwapAdapterSet(address adapter);
     event TargetICRSet(uint256 targetICR);
 
@@ -312,9 +320,117 @@ contract MezoLoopVault is ERC20, ReentrancyGuard, Ownable {
         _loopToTarget(maxIters);
     }
 
+    // ------------------------------------------------------------------
+    //  Keeper-style step API (off-chain hints)
+    // ------------------------------------------------------------------
+    //
+    // Mezo testnet blocks cap at ~10M gas. SortedTroves keeps every trove in
+    // a linked list sorted by nominal ICR, and inserting with an inexact
+    // hint triggers an O(n) list walk inside the protocol — several million
+    // gas on a populated list. The canonical Liquity pattern is therefore:
+    // resolve (prevId, nextId) OFF-CHAIN via HintHelpers.getApproxHint +
+    // SortedTroves.findInsertPosition (both free view calls), then submit a
+    // step transaction carrying the exact pair — insert/reInsert validates
+    // in O(1) and each step stays well under the block limit.
+
+    /// @notice Plan the next leverage step. `maxBorrowNow` is the protocol
+    /// headroom under the trove's lifetime-debt cap; when it is below
+    /// `borrowAmount` the keeper should call `refiStep` first, then re-plan.
+    function planLeverageStep()
+        external
+        view
+        returns (uint256 borrowAmount, uint256 maxBorrowNow, bool done)
+    {
+        (uint256 coll, uint256 debt, uint256 icr, uint8 status) = trove();
+        if (status != 1 || icr <= targetICR) return (0, 0, true);
+        uint256 feeRate = borrowerOperations.borrowingRate();
+        uint256 collUsd = (coll * _price()) / PRECISION;
+        uint256 dTarget = _borrowToReachTarget(collUsd, debt);
+        uint256 dCap = _borrowHeadroom(collUsd, debt, feeRate);
+        borrowAmount = dTarget < dCap ? dTarget : dCap;
+        uint256 maxCap = troveManager.getTroveMaxBorrowingCapacity(
+            address(this)
+        );
+        maxBorrowNow = maxCap > debt
+            ? ((maxCap - debt) * PRECISION) / (PRECISION + feeRate)
+            : 0;
+        if (borrowAmount < MIN_LOOP_BORROW) {
+            borrowAmount = 0;
+            done = true;
+        }
+    }
+
+    /// @notice Open the pooled trove. Hints are computed off-chain for the
+    /// post-open nominal ICR: nicr = coll * 1e20 / (debt*(1+fee) + gasComp).
+    function openTroveStep(
+        uint256 initialDebt,
+        address up,
+        address lo
+    ) external onlyOwner nonReentrant notPaused {
+        (, , , uint8 status) = trove();
+        if (status == 1) revert TroveAlreadyActive();
+        require(
+            !troveManager.checkRecoveryMode(_price()),
+            "recovery mode"
+        );
+        uint256 free = address(this).balance;
+        if (free == 0) revert ZeroAmount();
+        if (initialDebt == 0) {
+            initialDebt = (free * _price()) / 1.3e18;
+        }
+        uint256 minDebt = borrowerOperations.minNetDebt();
+        if (initialDebt < minDebt) revert DebtTooSmall(initialDebt, minDebt);
+        borrowerOperations.openTrove{value: free}(initialDebt, up, lo);
+        emit TroveOpened(free, initialDebt);
+    }
+
+    /// @notice Borrow `d` MUSD. Hints are for the post-borrow nominal ICR:
+    /// nicr = coll * 1e20 / (debt + d*(1+borrowingRate)).
+    function borrowStep(
+        uint256 d,
+        address up,
+        address lo
+    ) external onlyOwner nonReentrant {
+        borrowerOperations.withdrawMUSD(d, up, lo);
+    }
+
+    /// @notice Swap vault-held MUSD to BTC and top up collateral. Hints are
+    /// for the post-add nominal ICR using the adapter's quote as the BTC
+    /// estimate: nicr = (coll + quoteBtcOut) * 1e20 / debt.
+    function swapTopUpStep(
+        uint256 musdAmount,
+        address up,
+        address lo
+    ) external onlyOwner nonReentrant {
+        uint256 minOut = (swapAdapter.quoteMusdToBtc(musdAmount) *
+            (BPS - maxSlippageBps)) / BPS;
+        uint256 btcOut = swapAdapter.swapMusdForBtc(
+            musdAmount,
+            minOut,
+            payable(address(this))
+        );
+        borrowerOperations.addColl{value: btcOut}(up, lo);
+        emit Levered(musdAmount, btcOut, _currentICR());
+    }
+
+    /// @notice Refresh the trove's maxBorrowingCapacity via refinance().
+    /// Hints for the post-refi nominal ICR — the fee-only debt change means
+    /// the trove's current nicr is a fine approximation.
+    function refiStep(
+        address up,
+        address lo
+    ) external onlyOwner nonReentrant {
+        uint256 beforeCap = troveManager.getTroveMaxBorrowingCapacity(
+            address(this)
+        );
+        borrowerOperations.refinance(up, lo);
+        emit CapacityRefreshed(beforeCap);
+    }
+
     function _loopToTarget(uint8 maxIters) internal {
         if (maxIters > MAX_ITERS) maxIters = MAX_ITERS;
         uint256 feeRate = borrowerOperations.borrowingRate();
+        uint8 refis;
         for (uint8 i; i < maxIters; ++i) {
             (uint256 coll, uint256 debt, uint256 icr, uint8 status) = trove();
             if (status != 1) revert NoTrove();
@@ -327,6 +443,27 @@ contract MezoLoopVault is ERC20, ReentrancyGuard, Ownable {
                 uint256 dTarget = _borrowToReachTarget(collUsd, debt);
                 uint256 dCap = _borrowHeadroom(collUsd, debt, feeRate);
                 uint256 d = dTarget < dCap ? dTarget : dCap;
+                // MUSD also caps each trove's lifetime debt at
+                // getTroveMaxBorrowingCapacity — snapshotted at openTrove
+                // (coll*price/110%), lowered on collateral withdrawals, and
+                // NOT raised by addColl. refinance() recomputes it from the
+                // trove's CURRENT collateral, the protocol-sanctioned way to
+                // unlock headroom as swapped collateral lands.
+                uint256 maxCap = troveManager.getTroveMaxBorrowingCapacity(
+                    address(this)
+                );
+                uint256 dProto = maxCap > debt
+                    ? ((maxCap - debt) * PRECISION) / (PRECISION + feeRate)
+                    : 0;
+                if (dProto < d && refis < MAX_REFIS) {
+                    (address up, address lo) = _hints();
+                    try borrowerOperations.refinance(up, lo) {
+                        ++refis;
+                        emit CapacityRefreshed(maxCap);
+                        continue;
+                    } catch {}
+                }
+                if (d > dProto) d = dProto;
                 if (d < MIN_LOOP_BORROW) break;
                 _borrow(d);
                 _swapAndTopUp(d);

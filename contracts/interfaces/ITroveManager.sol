@@ -36,4 +36,12 @@ interface ITroveManager {
     ) external view returns (uint256);
     function getTCR(uint256 _price) external view returns (uint256);
     function checkRecoveryMode(uint256 _price) external view returns (bool);
+
+    /// @notice Lifetime debt ceiling for a trove. MUSD snapshots this at
+    /// openTrove (collateral*price/110%), shrinks it on collateral
+    /// withdrawals, and only recomputes it — from CURRENT collateral — on
+    /// refinance(). Crucially, addColl does NOT raise it.
+    function getTroveMaxBorrowingCapacity(
+        address _borrower
+    ) external view returns (uint256);
 }
