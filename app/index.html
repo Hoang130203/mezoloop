@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MezoLoop — Leveraged BTC Vault</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #0e0e11; color: #e8e6e3; margin: 0; padding: 2rem;
+      display: flex; justify-content: center;
+    }
+    main { width: 100%; max-width: 720px; }
+    h1 { font-size: 1.6rem; margin-bottom: 0.2rem; }
+    h1 span { color: #f7931a; }
+    .sub { color: #8b8b93; margin-bottom: 1.5rem; font-size: 0.85rem; }
+    .card {
+      background: #17171c; border: 1px solid #2a2a32; border-radius: 10px;
+      padding: 1.25rem; margin-bottom: 1rem;
+    }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; }
+    .stat label { display: block; color: #8b8b93; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat .v { font-size: 1.15rem; margin-top: 0.2rem; }
+    input, button {
+      font: inherit; background: #22222a; color: #e8e6e3;
+      border: 1px solid #3a3a44; border-radius: 8px; padding: 0.55rem 0.8rem;
+    }
+    button { cursor: pointer; background: #f7931a; border: none; color: #161005; font-weight: 700; }
+    button.ghost { background: transparent; border: 1px solid #f7931a; color: #f7931a; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; }
+    .mono { word-break: break-all; font-size: 0.75rem; color: #8b8b93; }
+    #log { white-space: pre-wrap; font-size: 0.75rem; color: #9ad29a; max-height: 180px; overflow-y: auto; }
+    .bar { height: 8px; border-radius: 4px; background: #2a2a32; overflow: hidden; margin-top: 0.4rem; }
+    .bar > div { height: 100%; background: linear-gradient(90deg, #f7931a, #ffb347); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Mezo<span>Loop</span></h1>
+  <div class="sub">Leveraged BTC vault · MUSD troves · Mezo Pools · testnet 31611</div>
+
+  <div class="card">
+    <div class="row">
+      <input id="vaultAddr" placeholder="MezoLoopVault address (0x…)" style="flex:1" />
+      <button id="connectBtn">Connect wallet</button>
+    </div>
+    <div class="mono" id="account"></div>
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <div class="stat"><label>Collateral</label><div class="v" id="sColl">—</div></div>
+      <div class="stat"><label>Debt (MUSD)</label><div class="v" id="sDebt">—</div></div>
+      <div class="stat"><label>ICR</label><div class="v" id="sIcr">—</div></div>
+      <div class="stat"><label>Equity</label><div class="v" id="sEq">—</div></div>
+      <div class="stat"><label>Leverage</label><div class="v" id="sLev">—</div></div>
+      <div class="stat"><label>NAV / share</label><div class="v" id="sNav">—</div></div>
+    </div>
+    <div class="bar"><div id="icrBar" style="width:0%"></div></div>
+    <div class="mono" style="margin-top:0.4rem">bar: ICR vs 200% reference · target 150% · floor 115%</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="depAmt" placeholder="deposit BTC (e.g. 0.05)" />
+      <button id="depositBtn">Deposit</button>
+    </div>
+    <div class="row" style="margin-top:0.6rem">
+      <input id="exitShares" placeholder="shares to exit (mlBTC)" />
+      <button id="exitBtn" class="ghost">Exit</button>
+      <div class="mono" id="myShares"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="enterBtn" class="ghost">enter() — open & loop (owner)</button>
+      <button id="loopBtn" class="ghost">loopToTarget()</button>
+      <button id="closeBtn" class="ghost">closeAll()</button>
+      <button id="refreshBtn" class="ghost">refresh</button>
+    </div>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+</main>
+<script type="module" src="./main.js"></script>
+</body>
+</html>
