@@ -57,7 +57,7 @@ async function main() {
   writeFileSync("deployments.json", JSON.stringify(out, null, 2));
   console.log("Wrote deployments.json");
   console.log(
-    `\nNext: deposit >= ~0.03 BTC (>= ~$2k at minNetDebt 1800), then call enter(0, 8).\n` +
+    `\nNext: deposit >= ~0.03 BTC (>= ~$2k at minNetDebt 1800), then run scripts/live.ts (keeper-step chunked loop).\n` +
       `Explorer: ${MEZO_TESTNET.explorer}/address/${vaultAddr}`
   );
 }
